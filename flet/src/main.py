@@ -2,14 +2,14 @@
 
 import flet as ft
 
+import api
 import theme
-import api  # noqa: F401
 
 
 def main(page: ft.Page) -> None:
     """Build the page."""
     theme.apply(page)
-    page.add(ft.Text("Hello"))
+    page.add(ft.Text(str(api.Reply(status=200).status)))
 
 
 ft.run(main)
