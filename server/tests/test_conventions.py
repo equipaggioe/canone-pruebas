@@ -1,0 +1,478 @@
+"""The conventions of fastapi.md and postgres.md in canone."""
+
+import ast
+import importlib
+import os
+import pkgutil
+import re
+import subprocess
+import sys
+from datetime import UTC, datetime
+from pathlib import Path
+from types import ModuleType
+from typing import Annotated, Any, TypeIs, get_args
+from urllib.parse import urlsplit
+
+import pytest
+import sqlalchemy as sa
+from fastapi import FastAPI, Query
+from httpx import ASGITransport, AsyncClient
+from pydantic import AwareDatetime, BaseModel, ValidationError
+
+import app.models
+import app.routers
+import app.schemas
+from app import errors, openapi
+from app.config import Settings, settings
+from app.database import engine
+from app.dependencies import SessionDep
+from app.main import app as main_app
+from app.models.base import Base
+from app.schemas.base import InputSchema, Schema, Timestamp
+from app.schemas.page import decode_token, encode_token
+
+
+def import_all(package: ModuleType) -> list[ModuleType]:
+    """Import every module of a package."""
+    return [
+        importlib.import_module(module.name)
+        for module in pkgutil.walk_packages(package.__path__, f"{package.__name__}.")
+    ]
+
+
+import_all(app.routers)
+SCHEMA_MODULES = import_all(app.schemas)
+TABLES = list(Base.metadata.tables.values())
+COLUMNS = [column for table in TABLES for column in table.columns]
+MODEL_FILES = sorted(Path(app.models.__path__[0]).glob("*/*.py"))
+
+
+def is_allowed_key(column: sa.Column[Any]) -> bool:
+    """Tell whether a key follows one of the rules of postgres.md."""
+    if isinstance(column.type, sa.Text):
+        return column.server_default is None and column.identity is None
+    if isinstance(column.type, (sa.SmallInteger, sa.BigInteger)):
+        return column.identity is not None and bool(column.identity.always)
+    if isinstance(column.type, sa.Uuid):
+        return str(getattr(column.server_default, "arg", "")) == "gen_random_uuid()"
+    return False
+
+
+def partition_columns(table: sa.Table) -> set[str]:
+    """Return the columns that partition a table, if any."""
+    partition = table.dialect_options["postgresql"].get("partition_by") or ""
+    return set(re.findall(r"\w+", partition)) & set(table.columns.keys())
+
+
+def is_allowed_primary_key(table: sa.Table) -> bool:
+    """Tell whether a table key follows postgres.md."""
+    columns = list(table.primary_key.columns)
+    partition = partition_columns(table)
+    if partition:
+        own = [column for column in columns if column.name not in partition]
+        names = {column.name for column in columns}
+        return partition <= names and len(own) == 1 and is_allowed_key(own[0])
+    if len(columns) == 1:
+        return is_allowed_key(columns[0])
+    return all(column.foreign_keys or isinstance(column.type, sa.Text) for column in columns)
+
+
+def test_primary_key_is_allowed() -> None:
+    """Every table has a key of the rules of postgres.md."""
+    offenders = [table.name for table in TABLES if not is_allowed_primary_key(table)]
+    assert not offenders
+
+
+def key_table(name: str, *columns: sa.Column[Any], **options: Any) -> sa.Table:
+    """Build a table apart from the models, to try a key on it."""
+    metadata = sa.MetaData()
+    sa.Table("account", metadata, sa.Column("id", sa.Uuid, primary_key=True))
+    return sa.Table(name, metadata, *columns, **options)
+
+
+@pytest.mark.parametrize(
+    ("table", "allowed"),
+    [
+        (
+            key_table(
+                "reading",
+                sa.Column("id", sa.BigInteger, sa.Identity(always=True), primary_key=True),
+                sa.Column("created_at", sa.DateTime(timezone=True), primary_key=True),
+                postgresql_partition_by="RANGE (created_at)",
+            ),
+            True,
+        ),
+        (
+            key_table(
+                "reading",
+                sa.Column("id", sa.BigInteger, primary_key=True),
+                sa.Column("created_at", sa.DateTime(timezone=True), primary_key=True),
+                postgresql_partition_by="RANGE (created_at)",
+            ),
+            False,
+        ),
+        (
+            key_table(
+                "role_permission",
+                sa.Column("role", sa.Text, primary_key=True),
+                sa.Column("permission", sa.Text, primary_key=True),
+            ),
+            True,
+        ),
+        (
+            key_table(
+                "membership",
+                sa.Column("account_id", sa.ForeignKey("account.id"), primary_key=True),
+                sa.Column("position", sa.Integer, primary_key=True),
+            ),
+            False,
+        ),
+    ],
+)
+def test_primary_key_rules(table: sa.Table, allowed: bool) -> None:
+    """Check partitioned keys and natural keys."""
+    assert is_allowed_primary_key(table) is allowed
+
+
+def test_foreign_keys_declare_on_delete() -> None:
+    """Every foreign key says CASCADE or RESTRICT."""
+    offenders = [
+        f"{key.parent.table.name}.{key.parent.name}"
+        for table in TABLES
+        for key in table.foreign_keys
+        if key.ondelete not in ("CASCADE", "RESTRICT")
+    ]
+    assert not offenders
+
+
+def test_foreign_keys_are_indexed() -> None:
+    """Every foreign key column leads an index."""
+    offenders = [
+        f"{table.name}.{key.parent.name}"
+        for table in TABLES
+        for key in table.foreign_keys
+        if not any(list(index.columns)[0] is key.parent for index in table.indexes)
+    ]
+    assert not offenders
+
+
+def test_strings_are_text() -> None:
+    """Every string column is created as TEXT."""
+    offenders = [
+        f"{column.table.name}.{column.name}"
+        for column in COLUMNS
+        if isinstance(column.type, sa.String)
+        and column.type.compile(dialect=engine.dialect) != "TEXT"
+    ]
+    assert not offenders
+
+
+def test_datetimes_are_aware() -> None:
+    """Every timestamp is timestamptz."""
+    offenders = [
+        f"{column.table.name}.{column.name}"
+        for column in COLUMNS
+        if isinstance(column.type, sa.DateTime) and not column.type.timezone
+    ]
+    assert not offenders
+
+
+def test_enums_are_checked_text() -> None:
+    """No column uses a native PostgreSQL enum."""
+    offenders = [
+        f"{column.table.name}.{column.name}"
+        for column in COLUMNS
+        if isinstance(column.type, sa.Enum) and column.type.native_enum
+    ]
+    assert not offenders
+
+
+def test_relationships_raise() -> None:
+    """Every relationship is declared with lazy="raise"."""
+    offenders = [
+        str(relationship)
+        for mapper in Base.registry.mappers
+        for relationship in mapper.relationships
+        if relationship.lazy != "raise"
+    ]
+    assert not offenders
+
+
+def is_mapped(node: ast.AST) -> TypeIs[ast.AnnAssign]:
+    """Tell whether a statement declares a column or a relationship."""
+    return (
+        isinstance(node, ast.AnnAssign)
+        and isinstance(node.annotation, ast.Subscript)
+        and getattr(node.annotation.value, "id", None) == "Mapped"
+    )
+
+
+def test_mapped_attributes_fit_one_line() -> None:
+    """Every column and relationship is declared on one line."""
+    offenders = [
+        f"{path.parent.name}/{path.name}:{node.lineno}"
+        for path in MODEL_FILES
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
+        if is_mapped(node) and node.lineno != node.end_lineno
+    ]
+    assert not offenders
+
+
+def test_schemas_inherit_schema() -> None:
+    """Every schema inherits the camelCase base."""
+    offenders = [
+        f"{module.__name__}.{name}"
+        for module in SCHEMA_MODULES
+        for name, value in vars(module).items()
+        if isinstance(value, type)
+        and issubclass(value, BaseModel)
+        and value.__module__ == module.__name__
+        and not issubclass(value, Schema)
+    ]
+    assert not offenders
+
+
+class Row:
+    """An object with a two-word attribute, like a row."""
+
+    created_at = datetime(2026, 1, 1, tzinfo=UTC)
+
+
+class Created(Schema):
+    """A response with a two-word field."""
+
+    created_at: Timestamp
+
+
+class CreatedInput(InputSchema):
+    """A body with a two-word field."""
+
+    created_at: Timestamp
+
+
+def test_schemas_read_rows_by_name() -> None:
+    """A response reads created_at of a row; a body only createdAt."""
+    assert Created.model_validate(Row()).model_dump() == {"createdAt": Row.created_at}
+    with pytest.raises(ValidationError):
+        CreatedInput.model_validate({"created_at": "2026-01-01T00:00:00Z"})
+
+
+def mentions_datetime(annotation: Any) -> bool:
+    """Tell whether a type holds a datetime that is not Timestamp."""
+    if annotation == Timestamp:
+        return False
+    return annotation in (datetime, AwareDatetime) or any(
+        mentions_datetime(arg) for arg in get_args(annotation)
+    )
+
+
+def test_schema_datetimes_are_timestamps() -> None:
+    """Every date and time of a schema is Timestamp."""
+    offenders = [
+        f"{module.__name__}.{name}.{field_name}"
+        for module in SCHEMA_MODULES
+        for name, value in vars(module).items()
+        if isinstance(value, type)
+        and issubclass(value, BaseModel)
+        and value.__module__ == module.__name__
+        for field_name, field in value.model_fields.items()
+        if mentions_datetime(field.rebuild_annotation())
+    ]
+    assert not offenders
+
+
+def test_settings_are_required() -> None:
+    """Every field of Settings is required and has no default."""
+    offenders = [name for name, field in Settings.model_fields.items() if not field.is_required()]
+    assert not offenders
+
+
+def test_operation_ids() -> None:
+    """Every operation has one tag and starts its camelCase ID by it."""
+    offenders = [
+        f"{method.upper()} {path}"
+        for path, operations in main_app.openapi()["paths"].items()
+        for method, operation in operations.items()
+        if len(operation.get("tags", [])) != 1
+        or not re.fullmatch(rf"{operation['tags'][0]}[A-Z][A-Za-z0-9]*", operation["operationId"])
+    ]
+    assert not offenders
+
+
+def test_openapi_file_is_current() -> None:
+    """openapi.json matches the app: python -m app.openapi."""
+    assert openapi.FILE.read_text(encoding="utf-8") == openapi.render()
+
+
+async def test_unknown_route_is_a_problem() -> None:
+    """A 404 leaves as problem+json."""
+    transport = ASGITransport(app=main_app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/no-such-route")
+    assert response.status_code == 404
+    assert response.headers["content-type"] == errors.PROBLEM_JSON
+    body = response.json()
+    assert len(body.pop("traceId")) == 32
+    assert body == {"type": "about:blank", "title": "Not Found", "status": 404}
+
+
+async def test_traceparent_starts_a_new_trace() -> None:
+    """The client does not pick the trace-id."""
+    sent = "4bf92f3577b34da6a3ce929d0e0e4736"
+    transport = ASGITransport(app=main_app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get(
+            "/no-such-route", headers={"traceparent": f"00-{sent}-00f067aa0ba902b7-01"}
+        )
+    assert response.json()["traceId"] not in (sent, "")
+
+
+# Starts and stops the app, and prints how many span processors it
+# added. FastAPI reads FASTAPI_OTEL_AUTO_CONFIGURE when it builds the
+# app, so the probe imports it in a process of its own.
+TELEMETRY_PROBE = """
+import asyncio
+from opentelemetry.sdk.trace import TracerProvider
+added = []
+TracerProvider.add_span_processor = lambda _, processor: added.append(processor)
+from app.main import app
+messages = iter([{"type": "lifespan.startup"}, {"type": "lifespan.shutdown"}])
+async def receive():
+    return next(messages)
+async def send(message):
+    pass
+asyncio.run(app({"type": "lifespan", "asgi": {"version": "3.0"}}, receive, send))
+print(len(added))
+"""
+
+
+def test_otlp_variables_export_nothing() -> None:
+    """The app adds no exporter, whatever the OTLP variables say."""
+    environment = os.environ | {
+        "FASTAPI_OTEL_AUTO_CONFIGURE": "true",
+        "OTEL_EXPORTER_OTLP_ENDPOINT": "http://127.0.0.1:4318",
+    }
+    result = subprocess.run(
+        [sys.executable, "-c", TELEMETRY_PROBE],
+        env=environment,
+        capture_output=True,
+        encoding="utf-8",
+        check=True,
+    )
+    assert result.stdout == "0\n"
+
+
+class Item(InputSchema):
+    """A body with a two-word field."""
+
+    item_name: str
+
+
+async def test_validation_error_points_to_the_field() -> None:
+    """A 422 points to the body field and the query parameter."""
+    probe = FastAPI()
+    errors.install(probe)
+
+    @probe.post("/items")
+    async def create_item(item: Item, limit: Annotated[int, Query()]) -> None:
+        """Accept an item."""
+
+    transport = ASGITransport(app=probe)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post("/items", params={"limit": "x"}, json={"itemName": 1})
+    assert response.status_code == 422
+    assert response.headers["content-type"] == errors.PROBLEM_JSON
+    body = response.json()
+    assert body["type"] == errors.VALIDATION.uri
+    assert {error.get("pointer") or error.get("parameter") for error in body["errors"]} == {
+        "/itemName",
+        "limit",
+    }
+
+
+@pytest.mark.parametrize(
+    ("minimum", "user_agent"),
+    [
+        ("1.4.0", "mobile/1.3.9"),
+        ("1.10.0", "mobile/1.9.0"),
+        ("1.4.0", "mobile/1.4"),
+        ("1.4.0", "mobile/abc"),
+        ("1.4.0", "mobile"),
+    ],
+)
+async def test_outdated_client_is_rejected(
+    monkeypatch: pytest.MonkeyPatch, minimum: str, user_agent: str
+) -> None:
+    """A version below the minimum, or malformed, is outdated."""
+    monkeypatch.setattr(settings, "min_client_versions", {"mobile": minimum})
+    transport = ASGITransport(app=main_app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/api/health", headers={"User-Agent": user_agent})
+    assert response.status_code == 400
+    assert response.headers["content-type"] == errors.PROBLEM_JSON
+    assert response.json()["type"] == errors.CLIENT_OUTDATED.uri
+
+
+async def test_problem_types_are_documented() -> None:
+    """The URI of each problem type serves its documentation."""
+    transport = ASGITransport(app=main_app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        for problem in errors.TYPES.values():
+            response = await client.get(urlsplit(problem.uri).path)
+            assert response.status_code == 200
+            assert response.headers["content-type"].startswith("text/html")
+            assert problem.title in response.text
+
+
+async def test_invalid_page_token_points_to_the_parameter() -> None:
+    """A bad page token, or one with other filters, is a 422."""
+    probe = FastAPI()
+    errors.install(probe)
+    position = (datetime(2026, 1, 1, tzinfo=UTC), 7)
+    token = encode_token(position, {"status": "open"})
+    assert decode_token(token, {"status": "open"}, tuple[datetime, int]) == position
+
+    @probe.get("/items")
+    async def list_items(
+        page_token: Annotated[str, Query(alias="pageToken")], status: str
+    ) -> None:
+        """Read the page token with the filters of the request."""
+        decode_token(page_token, {"status": status}, tuple[datetime, int])
+
+    transport = ASGITransport(app=probe)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        for params in (
+            {"pageToken": token, "status": "closed"},
+            {"pageToken": "x!", "status": "open"},
+        ):
+            response = await client.get("/items", params=params)
+            assert response.status_code == 422
+            assert response.json()["errors"] == [
+                {"detail": "Invalid page token", "parameter": "pageToken"}
+            ]
+
+
+async def test_failed_commit_is_a_server_error() -> None:
+    """A commit that fails answers 500, before any response."""
+    probe = FastAPI()
+    errors.install(probe)
+
+    @probe.post("/items")
+    async def create_item(session: SessionDep) -> None:
+        """Insert a duplicate that only the commit rejects."""
+        await session.execute(
+            sa.text(
+                "CREATE TEMP TABLE item (id int UNIQUE DEFERRABLE INITIALLY DEFERRED)"
+                " ON COMMIT DROP"
+            )
+        )
+        await session.execute(sa.text("INSERT INTO item VALUES (1), (1)"))
+
+    transport = ASGITransport(app=probe, raise_app_exceptions=False)
+    try:
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post("/items")
+    finally:
+        await engine.dispose()
+    assert response.status_code == 500
+    assert response.headers["content-type"] == errors.PROBLEM_JSON
