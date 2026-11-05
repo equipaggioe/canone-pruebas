@@ -3,6 +3,7 @@
 import flet as ft
 
 import theme
+import api  # noqa: F401
 
 
 def main(page: ft.Page) -> None:

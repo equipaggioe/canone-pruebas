@@ -16,8 +16,8 @@ from app.models.event.event_log import EventLog
 
 # The roles of the server and of the owner of the schema, as
 # install.py creates them.
-SERVER = "PRODUCTO"
-OWNER = "PRODUCTO_owner"
+SERVER = "producto"
+OWNER = "producto_owner"
 
 
 @event.listens_for(engine.sync_engine, "connect")

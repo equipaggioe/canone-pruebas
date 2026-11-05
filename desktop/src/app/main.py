@@ -5,13 +5,14 @@ import sys
 from PySide6.QtWidgets import QApplication, QLabel
 
 from app import theme
+from app.settings import Settings
 
 
 def main() -> int:
     """Run the app."""
     app = QApplication(sys.argv)
     theme.apply(app)
-    label = QLabel("Hello")
+    label = QLabel(Settings().title)
     label.show()
     return app.exec()
 

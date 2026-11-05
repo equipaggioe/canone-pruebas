@@ -18,7 +18,7 @@ branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
 # The role of the server, named as the app.
-ROLE = "PRODUCTO"
+ROLE = "producto"
 
 
 def upgrade() -> None:
