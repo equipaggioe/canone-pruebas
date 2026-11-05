@@ -94,6 +94,7 @@ jobs:
           PYTHONWARNDEFAULTENCODING: "1"
       - run: sudo apt-get install -y patchelf ccache
       - run: uv sync --group deploy
+      - run: mkdir -p dist && ls
       - run: uv run pyside6-deploy -c pysidedeploy.spec --force
 
   flet:
